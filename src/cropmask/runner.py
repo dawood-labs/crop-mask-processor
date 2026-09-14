@@ -19,7 +19,7 @@ import multiprocessing as mp
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import gcs
@@ -28,6 +28,7 @@ from .config import Config
 from .discovery import DistrictTask, build_index, select_tasks
 from .io_layers import read_boundaries
 from .pipeline import DistrictResult
+from .state import filter_pending, load_completed
 from .resources import (
     GIB,
     ResourcePlan,
@@ -49,14 +50,19 @@ class RunOutcome:
     anomalies: list[dict]
     plan: ResourcePlan
     seconds: float
+    #: Districts skipped because a previous run already finished them.
+    resumed: list = field(default_factory=list)
 
     @property
     def records(self) -> list[dict]:
-        return [r for res in self.results for r in res.records]
+        """Report rows for this run plus everything carried over from before."""
+        rows = [r for res in self.results for r in res.records]
+        rows += [r for done in self.resumed for r in done.records]
+        return rows
 
     @property
     def timings(self) -> list[dict]:
-        return [
+        rows = [
             {
                 "province": r.province,
                 "district": r.district,
@@ -64,9 +70,23 @@ class RunOutcome:
                 "peak_rss_mb": round(r.peak_rss_mb, 1),
                 "outputs": len(r.outputs),
                 "error": r.error or "",
+                "source": "this run",
             }
             for r in self.results
         ]
+        rows += [
+            {
+                "province": d.province,
+                "district": d.district,
+                "seconds": round(d.seconds, 1),
+                "peak_rss_mb": round(d.peak_rss_mb, 1),
+                "outputs": "",
+                "error": "",
+                "source": "resumed",
+            }
+            for d in self.resumed
+        ]
+        return rows
 
 
 def prepare(cfg: Config) -> tuple[list[DistrictTask], list[dict], Path]:
@@ -100,13 +120,32 @@ def run(cfg: Config) -> RunOutcome:
     started = time.time()
     tasks, anomalies, boundary_local = prepare(cfg)
 
+    resumed: list = []
+    if not cfg.overwrite:
+        completed = load_completed(cfg.output_uri, cfg.credentials_json)
+        if completed:
+            tasks, resumed = filter_pending(tasks, completed)
+            log.info(
+                "Resuming: %d district(s) already finished, %d left to do "
+                "(pass --overwrite to redo everything)",
+                len(resumed), len(tasks),
+            )
+
+    if not tasks and resumed:
+        log.info("Every selected district was already processed.")
+        empty_plan = plan_resources(
+            cfg.workers, cfg.memory_fraction, cfg.min_worker_memory,
+            cfg.cpu_oversubscribe,
+        )
+        return RunOutcome([], anomalies, empty_plan, time.time() - started, resumed)
+
     if not tasks:
         log.warning("Nothing to process.")
         empty_plan = plan_resources(
             cfg.workers, cfg.memory_fraction, cfg.min_worker_memory,
             cfg.cpu_oversubscribe,
         )
-        return RunOutcome([], anomalies, empty_plan, 0.0)
+        return RunOutcome([], anomalies, empty_plan, 0.0, resumed)
 
     plan = plan_resources(
         cfg.workers, cfg.memory_fraction, cfg.min_worker_memory, cfg.cpu_oversubscribe
@@ -127,7 +166,7 @@ def run(cfg: Config) -> RunOutcome:
     log.info("Memory model at end of run: %s", calibrator.summary())
 
     elapsed = time.time() - started
-    return RunOutcome(results, anomalies, plan, elapsed)
+    return RunOutcome(results, anomalies, plan, elapsed, resumed)
 
 
 def _execute(
@@ -154,7 +193,23 @@ def _execute(
             # A worker died outright - almost always the kernel OOM killer.
             # Halve the pool and pick up whatever is left.
             done = {(r.province, r.district) for r in results}
+            before = len(pending)
             pending = [t for t in pending if t.key not in done]
+            progressed = len(pending) < before
+
+            if not progressed and breaks >= 3:
+                # Three breaks with nothing completing in between is not memory
+                # pressure - the workers are failing at start-up (a bad import,
+                # a missing dependency). Shrinking the pool cannot fix that, and
+                # retrying just burns time.
+                log.error(
+                    "Worker pool broke %d times without completing a district - "
+                    "workers are failing to start. Abandoning %d district(s).",
+                    breaks, len(pending),
+                )
+                results += [_crash_result(t, "worker failed to start") for t in pending]
+                return results
+
             if workers <= 1:
                 log.error(
                     "Worker pool broke with a single worker; %d district(s) abandoned",
@@ -167,8 +222,9 @@ def _execute(
                 return results
             workers = max(1, workers // 2)
             log.error(
-                "Worker pool broke - retrying %d remaining district(s) with %d worker(s)",
-                len(pending), workers,
+                "Worker pool broke - %d district(s) done, retrying the remaining "
+                "%d with %d worker(s)",
+                len(results), len(pending), workers,
             )
 
 
@@ -179,13 +235,12 @@ def _pool_loop(
     plan: ResourcePlan,
     workers: int,
     boundary_local: Path,
-    already: list[DistrictResult],
-) -> list[DistrictResult]:
+    out: list[DistrictResult],
+) -> None:
     budget = plan.budget_bytes
     queue = list(pending)
-    out: list[DistrictResult] = []
-    total = len(already) + len(queue)
-    completed = len(already)
+    total = len(out) + len(queue)
+    completed = len(out)
 
     # "spawn" keeps GDAL/GEOS state out of the child processes and lets us
     # recycle workers, which returns memory to the OS between big districts.
@@ -274,7 +329,6 @@ def _pool_loop(
                         completed, total, task.province, task.district,
                         result.seconds, result.peak_rss_mb,
                     )
-    return out
 
 
 def _execute_serial(

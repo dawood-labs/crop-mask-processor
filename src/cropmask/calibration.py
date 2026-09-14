@@ -32,6 +32,15 @@ MIN_RATIO = 1.0
 #: Districts that must finish before measurements outrank the configured value.
 MIN_SAMPLES = 5
 
+#: Ignore districts smaller than this when fitting the ratio.
+#:
+#: Peak RSS for a small district is almost entirely the fixed worker baseline,
+#: so dividing the leftover by a tiny input produces a huge, meaningless ratio.
+#: On the 2025 run a 17 MB district measured 17x purely from baseline noise,
+#: which then had the 635 MB district reserving 16.8 GiB it could never use.
+#: Only districts large enough for the growth term to dominate are informative.
+MIN_INFORMATIVE_BYTES = 50 * 1024**2
+
 
 class MemoryCalibrator:
     """Thread-safe running estimate of peak RSS per byte of input."""
@@ -45,8 +54,15 @@ class MemoryCalibrator:
 
     # -- reporting ------------------------------------------------------
     def observe(self, input_bytes: int, peak_rss_bytes: float) -> None:
-        """Record what a district actually cost."""
+        """Record what a district actually cost.
+
+        Districts below :data:`MIN_INFORMATIVE_BYTES` are counted but not
+        fitted: their peak is baseline, not data, and the ratio they imply is
+        noise that would be extrapolated onto the largest district in the run.
+        """
         if input_bytes <= 0 or peak_rss_bytes <= 0:
+            return
+        if input_bytes < MIN_INFORMATIVE_BYTES:
             return
         growth = max(0.0, peak_rss_bytes - self._baseline)
         ratio = growth / input_bytes
