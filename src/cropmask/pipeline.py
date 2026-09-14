@@ -36,6 +36,39 @@ from .io_layers import read_geometries, write_intermediate, write_layer
 log = logging.getLogger(__name__)
 
 
+def _warn_if_layers_identical(layers, task, records) -> None:
+    """Flag two crops that loaded byte-identical geometry.
+
+    Two different crops having exactly the same feature count and the same
+    total area is not something real data does; it means both layers resolved
+    to the same file. That was a live bug - crop shapefiles are often named
+    after the district, so a basename lookup matched the wrong crop and the
+    output still looked plausible. This makes the next occurrence loud instead
+    of silent.
+    """
+    seen: dict[tuple[int, int], str] = {}
+    for crop in CROP_ORDER:
+        geoms = layers.get(crop)
+        if geoms is None or len(geoms) == 0:
+            continue
+        fingerprint = (len(geoms), int(G.total_acres(geoms) * 100))
+        twin = seen.get(fingerprint)
+        if twin:
+            message = (
+                f"{crop} and {twin} loaded identical geometry "
+                f"({len(geoms)} features, {G.total_acres(geoms)} acres) - "
+                f"almost certainly the same file read twice"
+            )
+            log.error("%s / %s: %s", task.province, task.district, message)
+            for name in (crop, twin):
+                records[name]["reason"] = (
+                    (records[name].get("reason", "") + " | " if records[name].get("reason") else "")
+                    + message
+                )
+        else:
+            seen[fingerprint] = crop
+
+
 def _staged_relpath(blob_name: str, input_uri: str) -> Path:
     """Where ``download_many`` puts a blob under the staging root.
 
@@ -201,6 +234,8 @@ def process_district(
                 result.records.append(records[crop])
             result.seconds = time.time() - started
             return result
+
+    _warn_if_layers_identical(layers, task, records)
 
     # ---- steps 1-3: crop-priority de-overlap ---------------------------
     maize, cane, cotton, rice = (

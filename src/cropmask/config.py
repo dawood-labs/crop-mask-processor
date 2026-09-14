@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -9,10 +10,15 @@ from typing import Any
 
 import yaml
 
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class Config:
     # ---- data location ---------------------------------------------------
+    #: Season being processed. Substituted into any URI containing ``{year}``,
+    #: so one config file serves every season from 2014 to 2026.
+    year: int | None = None
     #: ``gs://bucket/prefix`` holding ``<crop>/.../<province>/<district>/*.shp``
     input_uri: str = ""
     #: ``gs://bucket/prefix`` the results are written under.
@@ -105,9 +111,37 @@ class Config:
         data.update({k: v for k, v in overrides.items() if v is not None and k in known})
 
         cfg = cls(**data)
+        cfg._expand_year()
         cfg._resolve_env()
         cfg.validate()
         return cfg
+
+    def _expand_year(self) -> None:
+        """Substitute ``{year}`` into every path-like setting.
+
+        The pipeline will be run for each season from 2014 to 2026, and the
+        only thing that changes between them is the year in the bucket paths.
+        Templating it keeps one config file for all of them and makes it
+        impossible to point a 2019 run at the 2025 output prefix by editing
+        one URI and forgetting the other.
+        """
+        templated = ("input_uri", "output_uri", "boundary_uri", "work_dir",
+                     "report_name")
+        needs_year = [
+            name for name in templated
+            if "{year}" in str(getattr(self, name) or "")
+        ]
+        if not needs_year:
+            return
+        if self.year is None:
+            raise ValueError(
+                f"{', '.join(needs_year)} contain '{{year}}' but no year was given "
+                f"(set year: in the config or pass --year)"
+            )
+        for name in templated:
+            value = getattr(self, name)
+            if value:
+                setattr(self, name, str(value).replace("{year}", str(self.year)))
 
     def _resolve_env(self) -> None:
         if not self.credentials_json:
@@ -120,6 +154,15 @@ class Config:
         for name in ("input_uri", "output_uri", "boundary_uri"):
             if not getattr(self, name):
                 raise ValueError(f"config.{name} is required")
+        if self.year is not None and not (1900 <= int(self.year) <= 2100):
+            raise ValueError(f"year looks wrong: {self.year}")
+        if self.year is not None and str(self.year) not in self.output_uri:
+            # Overwriting last season's results is silent and expensive to undo.
+            log.warning(
+                "year=%s but output_uri (%s) does not mention it - check that "
+                "seasons are not writing on top of each other",
+                self.year, self.output_uri,
+            )
         if self.credentials_json and not Path(self.credentials_json).exists():
             raise FileNotFoundError(f"credentials_json not found: {self.credentials_json}")
         if not 0.1 <= self.memory_fraction <= 0.95:

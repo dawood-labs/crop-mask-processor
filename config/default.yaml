@@ -4,8 +4,13 @@
 # Test: cropmask -c config/default.yaml --limit 5
 
 # ---- data -------------------------------------------------------------
-input_uri:    "gs://farmdar_data_catalog/fao/crop_processing/2025"
-output_uri:   "gs://farmdar_data_catalog/fao/crop_processing/output/2025"
+# {year} is substituted from `year` below, or from --year on the command line,
+# so one config covers every season. Override per run:
+#     cropmask -c config/default.yaml --year 2019
+year: 2025
+
+input_uri:    "gs://farmdar_data_catalog/fao/crop_processing/{year}"
+output_uri:   "gs://farmdar_data_catalog/fao/crop_processing/output/{year}"
 boundary_uri: "gs://farmdar_data_catalog/fao/crop_processing/boundary/District-AOI-Boundary-From-FAO.shp"
 boundary_field: "districts"
 
@@ -41,7 +46,7 @@ keep_intermediates: false    # true writes the QA layers (~10x the output size)
 only_provinces: []
 only_districts: []
 limit: 0
-work_dir: "/tmp/cropmask"
-report_name: "acreage_report.xlsx"
+work_dir: "/tmp/cropmask/{year}"
+report_name: "acreage_report_{year}.xlsx"
 district_timeout: 5400
 log_level: "INFO"

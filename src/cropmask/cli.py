@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-c", "--config", help="YAML config file")
 
     g = p.add_argument_group("data")
+    g.add_argument("--year", type=int,
+                   help="season to process; fills {year} in the configured URIs")
     g.add_argument("--input-uri", help="gs://bucket/prefix holding the crop folders")
     g.add_argument("--output-uri", help="gs://bucket/prefix to write results under")
     g.add_argument("--boundary-uri", help="district boundary shapefile")
@@ -88,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(cfg.log_level, work_dir / "cropmask.log")
 
     log.info("=" * 72)
-    log.info("FAO crop-mask pipeline")
+    log.info("FAO crop-mask pipeline%s", f"  -  {cfg.year} season" if cfg.year else "")
     log.info("  input    : %s", cfg.input_uri)
     log.info("  output   : %s", cfg.output_uri)
     log.info("  boundary : %s", cfg.boundary_uri)
