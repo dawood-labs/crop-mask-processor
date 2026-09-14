@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cropmask"
+version = "1.0.0"
+description = "FAO crop-mask de-overlap pipeline (GCS in, GCS out)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "dawood-labs" }]
+dependencies = [
+    "geopandas>=1.0",
+    "shapely>=2.0",
+    "pyogrio>=0.7",
+    "pyproj>=3.5",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "psutil>=5.9",
+    "PyYAML>=6.0",
+    "openpyxl>=3.1",
+    "google-cloud-storage>=2.10",
+]
+
+[project.scripts]
+cropmask = "cropmask.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
