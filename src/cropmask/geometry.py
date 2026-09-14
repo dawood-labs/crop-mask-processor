@@ -176,11 +176,17 @@ def clean(geoms: GeomArray) -> GeomArray:
     if len(geoms) == 0:
         return empty_array()
 
-    bad = ~shapely.is_valid(geoms)
+    try:
+        bad = ~shapely.is_valid(geoms)
+    except shapely.errors.GEOSException:
+        bad = np.ones(len(geoms), dtype=bool)  # cannot tell: repair everything
     if bad.any():
         log.debug("repairing %d invalid geometries", int(bad.sum()))
         geoms = geoms.copy()
-        geoms[bad] = shapely.make_valid(geoms[bad])
+        geoms[bad] = _repair(geoms[bad])
+        geoms = geoms[shapely.is_valid_input(geoms) & ~shapely.is_missing(geoms)]
+        if len(geoms) == 0:
+            return empty_array()
 
     # make_valid can turn a self-intersecting polygon into a GeometryCollection
     # that mixes lines and polygons; keep the polygonal parts only.
@@ -190,6 +196,7 @@ def clean(geoms: GeomArray) -> GeomArray:
         geoms[mixed] = np.array(
             [_polygonal_parts_only(g) for g in geoms[mixed]], dtype=object
         )
+        geoms = geoms[~shapely.is_missing(geoms)]
 
     keep = np.isin(shapely.get_type_id(geoms), [3, 6])  # Polygon, MultiPolygon
     geoms = geoms[keep]
@@ -216,6 +223,62 @@ def _flatten_polygons(parts):
         else:
             out.append(p)
     return out
+
+
+def _repair(geoms: GeomArray) -> GeomArray:
+    """``make_valid`` that cannot take a layer down with it.
+
+    ``make_valid`` is itself a GEOS overlay and raises the same topology
+    exceptions as any other ("Ring edge missing" was seen on BAHAWALPUR,
+    LODHRAN and KHANEWAL in the 2025 data). Repair the batch if possible,
+    otherwise repair feature by feature, and fall back to a zero-width buffer -
+    the old GEOS trick that re-nodes a ring without going through MakeValid.
+    """
+    try:
+        return shapely.make_valid(geoms)
+    except shapely.errors.GEOSException:
+        pass
+
+    log.warning("batch make_valid failed on %d feature(s); repairing individually",
+                len(geoms))
+    out = np.empty(len(geoms), dtype=object)
+    for i, geom in enumerate(geoms):
+        out[i] = _repair_one(geom)
+    return out
+
+
+def _repair_one(geom):
+    try:
+        return shapely.make_valid(geom)
+    except shapely.errors.GEOSException:
+        pass
+    for grid_size in (1e-3, 1e-2):
+        try:
+            return shapely.make_valid(shapely.set_precision(geom, grid_size))
+        except shapely.errors.GEOSException:
+            continue
+    try:
+        return shapely.buffer(geom, 0)
+    except shapely.errors.GEOSException:
+        log.warning("dropped one feature that could not be repaired")
+        return None
+
+
+def _query(tree: "shapely.STRtree", geoms: GeomArray, predicate: str) -> np.ndarray:
+    """R-tree query that degrades to bounding boxes rather than failing.
+
+    Evaluating a predicate runs real geometry code and can raise. Bounding-box
+    candidates are a superset of the true matches, so falling back to them
+    costs a few redundant overlay calls but never changes the result: a pair
+    that does not actually intersect contributes nothing to a difference or an
+    intersection.
+    """
+    try:
+        return tree.query(geoms, predicate=predicate)
+    except shapely.errors.GEOSException as exc:
+        log.warning("R-tree '%s' query failed (%s); falling back to bounding boxes",
+                    predicate, exc)
+        return tree.query(geoms)
 
 
 def total_acres(geoms: GeomArray) -> float:
@@ -250,7 +313,7 @@ def erase(targets: GeomArray, erasers: GeomArray) -> GeomArray:
         return targets
 
     tree = shapely.STRtree(erasers)
-    hits = tree.query(targets, predicate="intersects")
+    hits = _query(tree, targets, "intersects")
     if hits.size == 0:
         return targets
 
@@ -289,7 +352,7 @@ def clip(targets: GeomArray, mask: GeomArray) -> GeomArray:
 
     tree = shapely.STRtree(np.array([mask_geom], dtype=object))
     touching = np.zeros(len(targets), dtype=bool)
-    hits = tree.query(targets, predicate="intersects")
+    hits = _query(tree, targets, "intersects")
     if hits.size:
         touching[hits[0]] = True
 
@@ -297,7 +360,12 @@ def clip(targets: GeomArray, mask: GeomArray) -> GeomArray:
     if len(kept) == 0:
         return empty_array()
 
-    inside = shapely.contains_properly(mask_geom, kept)
+    try:
+        inside = shapely.contains_properly(mask_geom, kept)
+    except shapely.errors.GEOSException:
+        # Cannot prove containment: clip everything, which is always correct
+        # and only costs the shortcut.
+        inside = np.zeros(len(kept), dtype=bool)
     out = kept.copy()
     edge = ~inside
     if edge.any():
@@ -322,7 +390,7 @@ def dissolve(geoms: GeomArray, max_component_union: int = 100_000) -> GeomArray:
         return _explode(geoms)
 
     tree = shapely.STRtree(geoms)
-    pairs = tree.query(geoms, predicate="intersects")
+    pairs = _query(tree, geoms, "intersects")
     pairs = pairs[:, pairs[0] != pairs[1]]
 
     if pairs.size == 0:
