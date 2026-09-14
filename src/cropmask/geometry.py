@@ -264,6 +264,82 @@ def _repair_one(geom):
         return None
 
 
+def _difference_one(target, cutter):
+    """Difference of two single geometries, or ``None`` if GEOS cannot do it.
+
+    This is the one call in the pipeline with no cheaper correct fallback: an
+    erase that silently does nothing leaves crop overlap in the deliverable,
+    which is the exact thing the job exists to remove. So it tries hard -
+    grid snapping, then repairing both operands and snapping again - and
+    reports failure rather than returning the un-erased target.
+    """
+    for grid_size in _GRID_LADDER:
+        try:
+            return (
+                shapely.difference(target, cutter) if grid_size is None
+                else shapely.difference(target, cutter, grid_size=grid_size)
+            )
+        except shapely.errors.GEOSException:
+            continue
+
+    repaired_target, repaired_cutter = _repair_one(target), _repair_one(cutter)
+    if repaired_target is None or repaired_cutter is None:
+        return None
+    for grid_size in _GRID_LADDER:
+        try:
+            return (
+                shapely.difference(repaired_target, repaired_cutter)
+                if grid_size is None
+                else shapely.difference(
+                    repaired_target, repaired_cutter, grid_size=grid_size
+                )
+            )
+        except shapely.errors.GEOSException:
+            continue
+    return None
+
+
+def _erase_one(target, erasers: GeomArray):
+    """Erase every eraser from one target, degrading as far as needed."""
+    cutter = erasers[0] if len(erasers) == 1 else None
+    if cutter is None:
+        try:
+            cutter = _union_all(erasers)
+        except shapely.errors.GEOSException:
+            cutter = None
+
+    if cutter is not None:
+        result = _difference_one(target, cutter)
+        if result is not None:
+            return result
+
+    # The combined cutter is what GEOS choked on; subtract the erasers one at
+    # a time instead. Each individual difference is a much simpler operation.
+    log.debug("combined erase failed; subtracting %d eraser(s) one by one",
+              len(erasers))
+    accumulated = target
+    failures = 0
+    for eraser in erasers:
+        step = _difference_one(accumulated, eraser)
+        if step is None:
+            failures += 1
+            continue
+        accumulated = step
+        if shapely.is_empty(accumulated):
+            return accumulated
+
+    if failures:
+        # Dropping the feature loses its acreage, which the report will show.
+        # Keeping it would leave undetected crop overlap, which the report
+        # would not.
+        log.warning(
+            "dropping 1 feature: %d eraser(s) could not be subtracted from it",
+            failures,
+        )
+        return None
+    return accumulated
+
+
 def _query(tree: "shapely.STRtree", geoms: GeomArray, predicate: str) -> np.ndarray:
     """R-tree query that degrades to bounding boxes rather than failing.
 
@@ -325,11 +401,18 @@ def erase(targets: GeomArray, erasers: GeomArray) -> GeomArray:
     starts = np.flatnonzero(np.r_[True, target_idx[1:] != target_idx[:-1]])
     ends = np.r_[starts[1:], len(target_idx)]
 
+    dropped = 0
     for s, e in zip(starts, ends):
         t = target_idx[s]
-        group = erasers[eraser_idx[s:e]]
-        cutter = group[0] if len(group) == 1 else _union_all(group)
-        out[t] = _safe(shapely.difference, out[t], cutter)
+        result = _erase_one(out[t], erasers[eraser_idx[s:e]])
+        if result is None:
+            dropped += 1
+        out[t] = result
+
+    if dropped:
+        log.warning("%d of %d feature(s) could not be erased and were dropped",
+                    dropped, len(targets))
+        out = out[out != None]  # noqa: E711 - numpy object comparison
 
     return clean(out)
 
