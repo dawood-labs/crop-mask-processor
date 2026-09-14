@@ -36,6 +36,20 @@ from .io_layers import read_geometries, write_intermediate, write_layer
 log = logging.getLogger(__name__)
 
 
+def _staged_relpath(blob_name: str, input_uri: str) -> Path:
+    """Where ``download_many`` puts a blob under the staging root.
+
+    Staging mirrors the bucket layout with the input prefix stripped, so the
+    crop directory stays in the path and two crops that share a filename stay
+    distinct.
+    """
+    from .gcs import GcsPath
+
+    prefix = GcsPath.parse(input_uri).prefix
+    rel = blob_name[len(prefix):] if prefix and blob_name.startswith(prefix) else blob_name
+    return Path(rel.lstrip("/"))
+
+
 def _concat(*arrays: G.GeomArray) -> G.GeomArray:
     parts = [a for a in arrays if len(a)]
     if not parts:
@@ -120,15 +134,19 @@ def process_district(
             layers[crop] = G.empty_array()
             continue
 
-        path = local_root / Path(task.crops[crop].shp_blob).name
+        path = local_root / _staged_relpath(task.crops[crop].shp_blob, cfg.input_uri)
         if not path.exists():
-            matches = list(local_root.rglob(Path(task.crops[crop].shp_blob).name))
-            if not matches:
-                rec["status"] = "error"
-                rec["reason"] = "staged shapefile not found on local disk"
-                layers[crop] = G.empty_array()
-                continue
-            path = matches[0]
+            # Never fall back to a basename search. Crop layers routinely share
+            # a filename - 58 of the 66 districts in the 2025 data have at
+            # least two crops whose shapefiles are both named after the
+            # district - so a basename match silently loads another crop's
+            # geometry, and the output looks entirely plausible.
+            rec["status"] = "error"
+            rec["reason"] = f"staged shapefile not found: {path}"
+            log.error("%s/%s: expected staged file missing: %s",
+                      task.district, crop, path)
+            layers[crop] = G.empty_array()
+            continue
 
         try:
             layers[crop] = read_geometries(path, metric)

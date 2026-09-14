@@ -92,3 +92,38 @@ def test_the_four_outputs_no_longer_overlap_each_other():
         for b in crops[i + 1:]:
             overlap = merged[a].intersection(merged[b]).area
             assert overlap == pytest.approx(0.0, abs=1e-6), f"{a} still overlaps {b}"
+
+
+# ------------------------------------------------- staged path resolution
+def test_staged_path_keeps_crops_with_the_same_filename_apart():
+    """Regression: crop layers routinely share a filename.
+
+    58 of the 66 districts in the 2025 data have two or more crops whose
+    shapefiles are both named after the district (Fall Maize, Rice and
+    Sugarcane all shipping 'BAHAWALNAGAR.shp'). Resolving by basename loads
+    one crop's geometry for another, and the output still looks plausible.
+    """
+    from cropmask.pipeline import _staged_relpath
+
+    uri = "gs://bucket/fao/crop_processing/2025"
+    maize = _staged_relpath(
+        "fao/crop_processing/2025/Fall Maize/2025/Punjab/BAHAWALNAGAR/BAHAWALNAGAR.shp",
+        uri,
+    )
+    rice = _staged_relpath(
+        "fao/crop_processing/2025/Rice/2025/Punjab/BAHAWALNAGAR/BAHAWALNAGAR.shp", uri
+    )
+    assert maize != rice
+    assert str(maize).startswith("Fall Maize/")
+    assert str(rice).startswith("Rice/")
+    assert maize.name == rice.name == "BAHAWALNAGAR.shp"
+
+
+def test_staged_path_handles_a_nested_subdirectory():
+    from cropmask.pipeline import _staged_relpath
+
+    got = _staged_relpath(
+        "fao/crop_processing/2025/Cotton/2025/Sindh/MIRPUR KHAS/sub/sub.shp",
+        "gs://bucket/fao/crop_processing/2025",
+    )
+    assert str(got) == "Cotton/2025/Sindh/MIRPUR KHAS/sub/sub.shp"
