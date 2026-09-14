@@ -42,11 +42,16 @@ POLYGONAL = {"Polygon", "MultiPolygon"}
 #:
 #: Real crop-mask data contains near-degenerate rings that make GEOS raise
 #: ``TopologyException: found non-noded intersection`` part-way through an
-#: overlay. Snapping the operands to a fixed grid re-nodes them and the
-#: operation succeeds. The steps run from 1 micrometre to 1 centimetre in the
-#: metric CRS - far below anything that can move an acreage figure - and the
-#: exact, unsnapped attempt is always tried first.
-_GRID_LADDER = (None, 1e-6, 1e-4, 1e-2)
+#: overlay (seen on SAHIWAL in the 2025 data). Snapping the operands to a fixed
+#: grid re-nodes them and the operation succeeds.
+#:
+#: The exact, unsnapped attempt always comes first because it is both the
+#: fastest and the most precise. Recovery steps are kept few and coarse on
+#: purpose: a failing overlay is expensive, so each extra rung costs real time,
+#: and snapping finer than a millimetre rarely fixes anything a millimetre
+#: cannot. 1 mm and 1 cm in UTM are far below any scale that can move an
+#: acreage figure.
+_GRID_LADDER = (None, 1e-3, 1e-2)
 
 
 def _safe(op, *args, **kwargs):
@@ -112,24 +117,46 @@ def _union_all(geoms: GeomArray):
         except shapely.errors.GEOSException as exc:
             last = exc
 
-    # Pairwise accumulation: isolates whichever feature GEOS cannot handle.
-    log.warning("union of %d features failed; accumulating pairwise", len(geoms))
-    acc = geoms[0]
-    for geom in geoms[1:]:
-        for grid_size in _GRID_LADDER:
-            try:
-                acc = (
-                    shapely.union(acc, geom) if grid_size is None
-                    else shapely.union(acc, geom, grid_size=grid_size)
-                )
-                break
-            except shapely.errors.GEOSException:
-                continue
-        else:
-            log.warning("skipped one feature GEOS could not union")
-    if acc is None:
-        raise last  # type: ignore[misc]
-    return acc
+    # Divide and conquer: halve the set until the offending features end up in
+    # a group small enough for GEOS to cope with, or are isolated and dropped.
+    # Sequential accumulation would be O(n^2) against an ever-growing geometry,
+    # which on a large component is slower than the failure it is recovering
+    # from.
+    log.warning("union of %d features failed; splitting", len(geoms))
+    return _union_divide(geoms, last)
+
+
+def _union_divide(geoms: GeomArray, last: Exception | None):
+    if len(geoms) == 1:
+        return geoms[0]
+
+    mid = len(geoms) // 2
+    halves = []
+    for half in (geoms[:mid], geoms[mid:]):
+        try:
+            halves.append(_union_all(half))
+        except shapely.errors.GEOSException:
+            halves.append(None)
+
+    left, right = halves
+    if left is None and right is None:
+        log.warning("dropped %d feature(s) GEOS could not union", len(geoms))
+        raise last if last else shapely.errors.GEOSException("union failed")
+    if left is None or right is None:
+        return left if right is None else right
+
+    for grid_size in _GRID_LADDER:
+        try:
+            return (
+                shapely.union(left, right) if grid_size is None
+                else shapely.union(left, right, grid_size=grid_size)
+            )
+        except shapely.errors.GEOSException:
+            continue
+
+    # The two halves cannot be joined at all; keep them side by side rather
+    # than losing either.
+    return shapely.union_all(np.array([left, right], dtype=object), grid_size=1e-2)
 
 
 def empty_array() -> GeomArray:
