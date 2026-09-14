@@ -21,6 +21,7 @@ from .config import Config
 from .discovery import DistrictTask
 from .io_layers import read_boundaries
 from .pipeline import DistrictResult, process_district
+from .state import write_marker
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ def run_district(task: DistrictTask) -> DistrictResult:
                     rec["output_path"] = f"{dest}/{rel}"
 
         result.peak_rss_mb = _peak_rss_mb()
+        write_marker(result, cfg.output_uri, cfg.work_dir, cfg.credentials_json)
         return result
 
     except Exception as exc:

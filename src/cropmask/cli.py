@@ -64,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("behaviour")
     g.add_argument("--keep-intermediates", action="store_true", default=None,
                    help="also write the per-step QA layers")
+    g.add_argument("--overwrite", action="store_true", default=None,
+                   help="reprocess districts a previous run already finished")
     g.add_argument("--work-dir", help="local scratch directory")
     g.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     g.add_argument("--dry-run", action="store_true",
@@ -168,6 +170,9 @@ def _summarise(outcome, report_path: Path, elapsed: float) -> None:
     log.info("Errors          : %d", errors)
     log.info("Total acreage   : %.2f", acres)
     log.info("Peak worker RSS : %.0f MB", peak)
+    if outcome.resumed:
+        log.info("Resumed         : %d district(s) carried over from a previous run",
+                 len(outcome.resumed))
     log.info("Report          : %s", report_path)
     log.info("Elapsed         : %.1f min", elapsed / 60)
     if slowest:

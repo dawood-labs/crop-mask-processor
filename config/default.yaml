@@ -31,6 +31,7 @@ max_tasks_per_child: 4       # recycle workers to hand memory back to the OS
 transfer_threads: 8
 
 # ---- behaviour --------------------------------------------------------
+overwrite: false             # false resumes: districts already done are skipped
 keep_intermediates: false    # true writes the QA layers (~10x the output size)
 only_provinces: []
 only_districts: []
