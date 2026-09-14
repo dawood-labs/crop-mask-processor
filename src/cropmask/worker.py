@@ -30,14 +30,29 @@ _BOUNDARY = None
 _LOOKUP: dict[str, list[int]] | None = None
 
 
-def init_worker(cfg: Config, boundary_local_path: str, log_level: str) -> None:
+def init_worker(
+    cfg: Config,
+    boundary_local_path: str,
+    log_level: str,
+    log_file: str | None = None,
+) -> None:
     """Pool initializer: load the boundary once per process, not once per task."""
     global _CFG, _BOUNDARY, _LOOKUP
+
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        # Workers are where the interesting failures happen, so their
+        # tracebacks have to reach the same file as the parent's log rather
+        # than only the inherited stderr, which a piped or detached run loses.
+        # Each record is one small append, which the kernel does not interleave.
+        handlers.append(logging.FileHandler(log_file, mode="a", encoding="utf-8"))
 
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s  %(levelname)-7s  [w%(process)d]  %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers,
+        force=True,
     )
     for noisy in ("pyogrio", "fiona", "urllib3", "google"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

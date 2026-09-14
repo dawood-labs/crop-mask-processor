@@ -194,7 +194,8 @@ def _pool_loop(
         max_workers=workers,
         mp_context=ctx,
         initializer=init_worker,
-        initargs=(cfg, str(boundary_local), cfg.log_level),
+        initargs=(cfg, str(boundary_local), cfg.log_level,
+                  str(Path(cfg.work_dir) / "cropmask.log")),
         max_tasks_per_child=cfg.max_tasks_per_child or None,
     ) as pool:
         inflight: dict = {}
@@ -281,7 +282,8 @@ def _execute_serial(
 ) -> list[DistrictResult]:
     """Single-process fallback: easier to profile and to debug a crash."""
     log.info("Running serially (1 worker)")
-    init_worker(cfg, str(boundary_local), cfg.log_level)
+    init_worker(cfg, str(boundary_local), cfg.log_level,
+                str(Path(cfg.work_dir) / "cropmask.log"))
     results = []
     for n, task in enumerate(ordered, 1):
         log.info("[%d/%d] %s / %s", n, len(ordered), task.province, task.district)
