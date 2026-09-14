@@ -17,6 +17,8 @@ import json
 import logging
 from dataclasses import dataclass
 
+from google.api_core.exceptions import NotFound
+
 from . import gcs
 from .discovery import norm_name
 
@@ -81,9 +83,16 @@ def load_completed(
 
     try:
         blobs = gcs.list_blobs(f"gs://{dest.bucket}/{prefix}", credentials_json)
-    except Exception as exc:
-        log.debug("no resumable state at %s: %s", prefix, exc)
+    except NotFound:
         return {}
+    except Exception as exc:
+        # "I could not find out what was already done" must never be silently
+        # treated as "nothing was done" - that quietly reprocesses and
+        # re-uploads every district.
+        raise RuntimeError(
+            f"could not read resume state at {prefix}: {exc}. "
+            f"Re-run with --overwrite to start from scratch deliberately."
+        ) from exc
 
     client = gcs.get_client(credentials_json)
     bucket = client.bucket(dest.bucket)

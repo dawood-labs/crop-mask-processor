@@ -120,7 +120,13 @@ def main(argv: list[str] | None = None) -> int:
                   report_path, exc)
 
     _summarise(outcome, report_path, time.time() - started)
-    return 1 if any(r.error for r in outcome.results) else 0
+    # Per-crop failures are recorded on the rows, not on the district result,
+    # so a run where every district failed its boundary lookup would otherwise
+    # exit 0 and read as success to any wrapper script.
+    failed = any(r.error for r in outcome.results) or any(
+        rec.get("status") == "error" for rec in outcome.records
+    )
+    return 1 if failed else 0
 
 
 def _dry_run(cfg: Config) -> int:

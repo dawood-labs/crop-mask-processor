@@ -46,12 +46,15 @@ POLYGONAL = {"Polygon", "MultiPolygon"}
 #: grid re-nodes them and the operation succeeds.
 #:
 #: The exact, unsnapped attempt always comes first because it is both the
-#: fastest and the most precise. Recovery steps are kept few and coarse on
-#: purpose: a failing overlay is expensive, so each extra rung costs real time,
-#: and snapping finer than a millimetre rarely fixes anything a millimetre
-#: cannot. 1 mm and 1 cm in UTM are far below any scale that can move an
-#: acreage figure.
-_GRID_LADDER = (None, 1e-3, 1e-2)
+#: fastest and the most precise, and only one recovery rung follows it: a
+#: failing overlay is expensive, so each extra rung costs real time.
+#:
+#: 1 mm is the coarsest snap that is safe here. Snapping does not merely move
+#: vertices - it pinches shut any neck narrower than the grid, which can split
+#: one polygon into two. At 1 cm a 0.9-acre field with a 5 mm waist becomes two
+#: 0.45-acre parts, and both are then deleted by the 0.5-acre rule. The area
+#: displacement was never the risk; the topology change was.
+_GRID_LADDER = (None, 1e-3)
 
 
 def _safe(op, *args, **kwargs):
@@ -70,7 +73,7 @@ def _safe(op, *args, **kwargs):
             last = exc
             log.debug("%s failed at grid_size=%s: %s", op.__name__, grid_size, exc)
 
-    if args and isinstance(args[0], np.ndarray) and args[0].size > 1:
+    if args and isinstance(args[0], np.ndarray) and args[0].size >= 1:
         log.warning(
             "%s failed on %d features even with grid snapping; "
             "falling back to per-feature evaluation", op.__name__, args[0].size
@@ -81,6 +84,14 @@ def _safe(op, *args, **kwargs):
 
 
 def _elementwise(op, first: GeomArray, *rest, **kwargs):
+    """Evaluate ``op`` one feature at a time, keeping the array length.
+
+    The result is written back into boolean-masked slices by the callers, so it
+    must stay the same length as the input; returning only the successes made
+    ``clip`` raise ValueError and cost the whole district - the opposite of
+    what this fallback exists for. Failures are left as ``None`` and removed by
+    the ``clean()`` every caller already runs.
+    """
     out = np.empty(len(first), dtype=object)
     dropped = 0
     for i, geom in enumerate(first):
@@ -101,7 +112,7 @@ def _elementwise(op, first: GeomArray, *rest, **kwargs):
             dropped += 1
     if dropped:
         log.warning("dropped %d feature(s) GEOS could not process", dropped)
-    return out[out != None]  # noqa: E711 - numpy object comparison
+    return out
 
 
 def _union_all(geoms: GeomArray):
@@ -143,7 +154,16 @@ def _union_divide(geoms: GeomArray, last: Exception | None):
         log.warning("dropped %d feature(s) GEOS could not union", len(geoms))
         raise last if last else shapely.errors.GEOSException("union failed")
     if left is None or right is None:
-        return left if right is None else right
+        # Returning the surviving half would be a silent, unlogged data loss,
+        # and the callers cannot tell a partial union from a complete one. As
+        # an eraser it leaves crop overlap; as a district mask it clips every
+        # crop to half the district, with all four acreages falling together
+        # and looking entirely plausible. Fail instead, so _erase_one falls
+        # back to subtracting the erasers one at a time - which is correct.
+        lost = mid if left is None else len(geoms) - mid
+        log.error("union lost %d of %d feature(s) - refusing to return a "
+                  "partial result", lost, len(geoms))
+        raise last if last else shapely.errors.GEOSException("partial union")
 
     for grid_size in _GRID_LADDER:
         try:
@@ -257,11 +277,18 @@ def _repair_one(geom):
             return shapely.make_valid(shapely.set_precision(geom, grid_size))
         except shapely.errors.GEOSException:
             continue
-    try:
-        return shapely.buffer(geom, 0)
-    except shapely.errors.GEOSException:
-        log.warning("dropped one feature that could not be repaired")
-        return None
+    # There is deliberately no buffer(0) rung here. It is the traditional last
+    # resort, but it is not area-preserving: on a self-intersecting ring it
+    # applies winding semantics where make_valid preserves the covered area,
+    # so a bow-tie comes back at 1.0 instead of 2.0. Worse, the loss cannot be
+    # detected - GEOS reports the area of the invalid input as 0.0, so there is
+    # no trustworthy figure to compare the repair against.
+    #
+    # By this point make_valid has failed at full precision and at both grid
+    # sizes, so nothing here can be trusted. Drop the feature and say so: the
+    # acreage loss is visible in the report, a silently halved polygon is not.
+    log.warning("dropped one feature that could not be repaired")
+    return None
 
 
 def _difference_one(target, cutter):
@@ -521,7 +548,12 @@ def filter_by_area(geoms: GeomArray, min_acres: float) -> tuple[GeomArray, np.nd
     if len(geoms) == 0:
         return empty_array(), np.empty(0), 0, 0.0
 
-    acres = np.round(shapely.area(geoms) / SQM_PER_ACRE, 2)
-    keep = acres > min_acres
-    dropped_acres = round(float(acres[~keep].sum()), 2)
-    return geoms[keep], acres[keep], int((~keep).sum()), dropped_acres
+    # Compare the unrounded area. Rounding first makes the effective threshold
+    # 0.505 acres, not 0.5: anything in (0.5000, 0.5050] rounds to 0.50 and is
+    # dropped even though the spec says to keep it. The bias is one-sided - it
+    # only ever deletes land - so on a large district it quietly removes
+    # hundreds of acres.
+    raw = shapely.area(geoms) / SQM_PER_ACRE
+    keep = raw > min_acres
+    dropped_acres = round(float(raw[~keep].sum()), 2)
+    return geoms[keep], np.round(raw[keep], 2), int((~keep).sum()), dropped_acres

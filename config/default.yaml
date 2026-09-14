@@ -14,7 +14,12 @@ boundary_field: "districts"
 credentials_json: null
 
 # ---- processing -------------------------------------------------------
-metric_crs: "EPSG:32642"     # UTM 42N - all geometry ops and area maths
+# UTM 42N is an FAO requirement - do not change it. Known and accepted
+# consequence: the zone's central meridian is 69E, so eastern Punjab sits
+# 4-5 degrees outside it and its acreage reads ~0.3-0.5% high relative to
+# Sindh. An equal-area CRS would remove that but would no longer match the
+# figures FAO expects.
+metric_crs: "EPSG:32642"     # all geometry ops and area maths
 output_crs: "EPSG:4326"      # shapefiles are written in lat/lon
 min_polygon_acres: 0.5       # polygons at or below this are dropped
 min_total_acres: 200.0       # a crop layer at or below this is dropped entirely

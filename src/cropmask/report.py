@@ -11,7 +11,7 @@ log = logging.getLogger(__name__)
 
 COLUMN_ORDER = [
     "province", "district", "crop", "predicted", "status", "reason",
-    "input_polygons", "input_acres",
+    "input_polygons", "input_acres", "input_union_acres",
     "after_difference_acres", "after_clip_acres",
     "singlepart_polygons", "singlepart_acres",
     "removed_small_polygons", "acres_removed_small",
@@ -39,15 +39,24 @@ def build_report(
 
     by_crop = pd.DataFrame()
     if not kept.empty:
+        # Count province+district pairs: two provinces can share a district name.
+        kept = kept.assign(_place=kept["province"].astype(str) + "/" + kept["district"].astype(str))
         by_crop = kept.groupby("crop", as_index=False).agg(
-            districts=("district", "nunique"),
+            districts=("_place", "nunique"),
             polygons=("final_polygons", "sum"),
             input_acres=("input_acres", "sum"),
+            input_union_acres=("input_union_acres", "sum"),
             final_acres=("final_acres", "sum"),
         )
-        by_crop["acres_lost"] = (by_crop["input_acres"] - by_crop["final_acres"]).round(2)
+        # Retention is measured against the dissolved input, not the raw sum:
+        # final_acres is taken after a dissolve, so comparing it with a figure
+        # that double-counts self-overlap reports loss that never happened.
+        by_crop["acres_lost"] = (
+            by_crop["input_union_acres"] - by_crop["final_acres"]
+        ).round(2)
         by_crop["retained_pct"] = (
-            100 * by_crop["final_acres"] / by_crop["input_acres"].replace(0, pd.NA)
+            100 * by_crop["final_acres"]
+            / by_crop["input_union_acres"].replace(0, pd.NA)
         ).round(2)
 
     by_district = pd.DataFrame()

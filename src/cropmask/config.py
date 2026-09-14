@@ -26,6 +26,15 @@ class Config:
 
     # ---- processing ------------------------------------------------------
     #: Projected CRS used for every geometry op and all area maths.
+    #:
+    #: UTM 42N is specified by FAO and must not be changed. Note the known
+    #: consequence: the zone's central meridian is 69E, so Sindh sits near it
+    #: while eastern Punjab (Bahawalnagar ~73.3E, Lahore ~74.3E) is 4-5 degrees
+    #: outside the zone, where the UTM area scale factor runs about 1.003-1.005.
+    #: Punjab acreage is therefore reported roughly 0.3-0.5% higher than the
+    #: same physical area in Sindh. This is a property of the specified
+    #: projection, not a defect - an equal-area CRS would remove it but would
+    #: also stop matching the figures FAO expects.
     metric_crs: str = "EPSG:32642"
     #: CRS the final shapefiles are written in (None = keep metric_crs).
     output_crs: str | None = "EPSG:4326"

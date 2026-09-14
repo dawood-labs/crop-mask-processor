@@ -162,7 +162,33 @@ def estimate_district_memory(input_bytes: int, factor: float) -> int:
     return WORKER_BASELINE_BYTES + int(input_bytes * factor)
 
 
+def total_memory() -> int:
+    """Bytes of RAM this process may use in total, honouring a cgroup limit."""
+    total = psutil.virtual_memory().total
+    for path in ("/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read().strip()
+            if raw == "max":
+                continue
+            limit = int(raw)
+            if 0 < limit < (1 << 62):
+                total = min(total, limit)
+        except (OSError, ValueError):
+            continue
+    return total
+
+
 def memory_pressure() -> float:
-    """Fraction of system memory currently in use (0.0 - 1.0)."""
-    vm = psutil.virtual_memory()
-    return 1.0 - (vm.available / vm.total)
+    """Fraction of usable memory currently in use (0.0 - 1.0).
+
+    This must measure the same pool the budget is drawn from. Reading the
+    host's totals inside a container makes the admission ceiling dead in
+    exactly the deployment that needs it: a 48 GiB cgroup on a 512 GiB host
+    can be at its limit while host-wide pressure reads 8%.
+    """
+    total = total_memory()
+    if total <= 0:
+        return 0.0
+    return 1.0 - (available_memory() / total)

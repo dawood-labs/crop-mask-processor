@@ -164,7 +164,14 @@ def build_index(
                  "used": chosen.shp_blob,
                  "ignored": " | ".join(chosen.rejected)}
             )
-        task = tasks.setdefault((province, district), DistrictTask(province, district))
+        # Key on the normalised names, not the raw folder strings. The bucket
+        # spells the same district differently across crop trees
+        # ("RAHIM YAR KHAN" vs "Rahim Yar Khan"), and keying on the raw text
+        # splits one district into two tasks: neither erases the other's crops,
+        # both write to the same completion marker, and the workbook counts the
+        # district twice.
+        key = (norm_name(province), norm_name(district))
+        task = tasks.setdefault(key, DistrictTask(province, district))
         task.crops[crop] = chosen
 
     if unmatched:

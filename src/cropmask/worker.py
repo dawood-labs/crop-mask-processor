@@ -25,6 +25,11 @@ from .state import write_marker
 
 log = logging.getLogger(__name__)
 
+#: Districts this process has already run. ``ru_maxrss`` is a process-lifetime
+#: high-water mark, so only the first district's peak describes its own work;
+#: later ones inherit the largest peak the process has ever reached.
+_TASKS_RUN = 0
+
 # Per-process caches, populated once by the pool initializer.
 _CFG: Config | None = None
 _BOUNDARY = None
@@ -80,6 +85,10 @@ def run_district(task: DistrictTask) -> DistrictResult:
     assert _CFG is not None and _LOOKUP is not None, "worker not initialised"
     cfg = _CFG
 
+    global _TASKS_RUN
+    first_task = _TASKS_RUN == 0
+    _TASKS_RUN += 1
+
     work = Path(tempfile.mkdtemp(prefix=f"{task.district.replace(' ', '_')}_",
                                  dir=cfg.work_dir))
     staged = work / "in"
@@ -119,7 +128,17 @@ def run_district(task: DistrictTask) -> DistrictResult:
                     rec["output_path"] = f"{dest}/{rel}"
 
         result.peak_rss_mb = _peak_rss_mb()
-        write_marker(result, cfg.output_uri, cfg.work_dir, cfg.credentials_json)
+        result.peak_is_own_work = first_task
+
+        # A marker means "this district is done, skip it next time". Writing one
+        # for a district that errored makes the failure permanent: the operator
+        # fixes the input, re-runs, and the district is skipped while its stale
+        # error rows are replayed into the workbook.
+        if not any(r.get("status") == "error" for r in result.records):
+            write_marker(result, cfg.output_uri, cfg.work_dir, cfg.credentials_json)
+        else:
+            log.warning("%s / %s had errors - no completion marker written, "
+                        "so a re-run will retry it", task.province, task.district)
         return result
 
     except Exception as exc:
@@ -127,6 +146,7 @@ def run_district(task: DistrictTask) -> DistrictResult:
         res = DistrictResult(province=task.province, district=task.district)
         res.error = f"{type(exc).__name__}: {exc}"
         res.peak_rss_mb = _peak_rss_mb()
+        res.peak_is_own_work = first_task
         res.records = [{
             "province": task.province,
             "district": task.district,

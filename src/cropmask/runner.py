@@ -182,14 +182,19 @@ def _execute(
     pending = list(ordered)
     results: list[DistrictResult] = []
     workers = plan.workers
+    breaks = 0
 
     while True:
         try:
-            results += _pool_loop(
+            # _pool_loop appends into `results`; it returns nothing, because a
+            # returned list would be lost when BrokenProcessPool unwinds out of
+            # it - which previously made the retry restart the whole run.
+            _pool_loop(
                 cfg, pending, calibrator, plan, workers, boundary_local, results
             )
             return results
         except BrokenProcessPool:
+            breaks += 1
             # A worker died outright - almost always the kernel OOM killer.
             # Halve the pool and pick up whatever is left.
             done = {(r.province, r.district) for r in results}
@@ -312,13 +317,25 @@ def _pool_loop(
                           cfg.district_timeout)
                 continue
 
+            broke: BrokenProcessPool | None = None
             for future in done:
                 task = inflight.pop(future)
                 claimed -= reserved.pop(task.key, 0)
                 completed += 1
-                result = future.result()  # BrokenProcessPool propagates on purpose
+                try:
+                    result = future.result()
+                except BrokenProcessPool as exc:
+                    # Keep draining: the other futures in this batch already
+                    # hold finished work, and dropping them would have the
+                    # retry recompute districts that are actually done.
+                    broke = exc
+                    continue
+                except Exception as exc:
+                    # Anything else is this district's problem, not the run's.
+                    result = _crash_result(task, f"{type(exc).__name__}: {exc}")
                 out.append(result)
-                if cfg.adaptive_memory and result.peak_rss_mb:
+                if (cfg.adaptive_memory and result.peak_rss_mb
+                        and result.peak_is_own_work):
                     calibrator.observe(task.size_bytes, result.peak_rss_mb * 1024**2)
                 if result.error:
                     log.error("[%d/%d] %s / %s FAILED: %s", completed, total,
@@ -329,6 +346,8 @@ def _pool_loop(
                         completed, total, task.province, task.district,
                         result.seconds, result.peak_rss_mb,
                     )
+            if broke is not None:
+                raise broke
 
 
 def _execute_serial(

@@ -65,6 +65,9 @@ class DistrictResult:
     outputs: list[Path] = field(default_factory=list)
     seconds: float = 0.0
     peak_rss_mb: float = 0.0
+    #: False when the process had already run another district, in which case
+    #: ``peak_rss_mb`` is that district's high-water mark, not this one's.
+    peak_is_own_work: bool = True
     error: str | None = None
 
 
@@ -76,6 +79,7 @@ def _blank_record(province: str, district: str, crop: str, source: str = "") -> 
         "input_shapefile": source,
         "input_polygons": 0,
         "input_acres": 0.0,
+        "input_union_acres": 0.0,
         "after_difference_acres": 0.0,
         "after_clip_acres": 0.0,
         "singlepart_polygons": 0,
@@ -158,7 +162,45 @@ def process_district(
             continue
 
         rec["input_polygons"] = len(layers[crop])
+        # Two different measures, both needed. input_acres is the raw sum of
+        # feature areas, which double-counts any overlap *within* the layer;
+        # it is kept because the legacy report used it. input_union_acres
+        # measures the ground actually covered, which is the only figure
+        # comparable with final_acres - that is taken after the dissolve has
+        # collapsed self-overlap to once.
         rec["input_acres"] = G.total_acres(layers[crop])
+        rec["input_union_acres"] = G.union_acres(layers[crop])
+
+    # A crop we failed to READ is not the same as a crop this district does not
+    # grow. An unreadable layer becomes an empty array, and erasing with an
+    # empty array is the identity - so a crop that should have been cut by it
+    # would silently skip being de-overlapped and still be published as "kept",
+    # carrying exactly the overlap this pipeline exists to remove.
+    #
+    # Only crops *below* the failure are affected: CROP_ORDER is the priority
+    # order, and a layer is only ever erased by the ones before it. A failure
+    # in the last crop (Rice) compromises nothing, because Rice erases nothing.
+    unreadable = {c for c in CROP_ORDER if records[c]["status"] == "error"}
+    if unreadable:
+        for position, crop in enumerate(CROP_ORDER):
+            blocking = unreadable.intersection(CROP_ORDER[:position])
+            if not blocking or records[crop]["status"] in ("error", "missing"):
+                continue
+            records[crop]["status"] = "error"
+            records[crop]["reason"] = (
+                "de-overlap incomplete: could not read "
+                + ", ".join(sorted(blocking))
+            )
+            log.error("%s / %s: %s will not be published - %s",
+                      task.province, task.district, crop,
+                      records[crop]["reason"])
+        compromised = [c for c in CROP_ORDER if records[c]["status"] == "error"]
+        result.error = "could not read " + ", ".join(sorted(unreadable))
+        if set(compromised) == set(CROP_ORDER):
+            for crop in CROP_ORDER:
+                result.records.append(records[crop])
+            result.seconds = time.time() - started
+            return result
 
     # ---- steps 1-3: crop-priority de-overlap ---------------------------
     maize, cane, cotton, rice = (
@@ -209,7 +251,13 @@ def process_district(
             log.exception("%s/%s: step 5 failed", task.district, crop)
             rec["status"] = "error"
             rec["reason"] = f"step5 error: {exc}"
-        rec["acres_lost_total"] = round(rec["input_acres"] - rec["final_acres"], 2)
+        # Subtract like from like: the raw sum would report a layer with
+        # internal self-overlap as having "lost" acreage the de-overlap never
+        # touched. Fall Maize is never erased at all, yet the old figure had it
+        # retaining 63% - that 37% was double counting, not loss.
+        rec["acres_lost_total"] = round(
+            rec["input_union_acres"] - rec["final_acres"], 2
+        )
         result.records.append(rec)
 
     kept = [r["crop"] for r in result.records if r["status"] == "kept"]
@@ -250,6 +298,9 @@ def _finalise(geoms, crop, task, out_root: Path, rec: dict, inter_dir: Path, cfg
         rec["status"] = "dropped"
         rec["reason"] = f"total {total} acres <= {cfg.min_total_acres} acre threshold"
         rec["final_polygons"] = 0
+        # Nothing was published, so nothing was retained. Leaving the measured
+        # total here made acres_lost_total understate the loss by exactly it.
+        rec["final_acres"] = 0.0
         return None
 
     path = final_output_path(out_root, crop, task.province, task.district)
