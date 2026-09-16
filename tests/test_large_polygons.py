@@ -292,3 +292,61 @@ def test_a_light_geometry_is_never_tested_against_an_unprepared_heavy_one(monkey
     assert not violations, (
         f"light geometries were tested against unprepared heavy ones: {violations[:3]}"
     )
+
+
+# --------------------------------------------------------------------------
+# union with one very large member
+# --------------------------------------------------------------------------
+def _component_around_giant(n=120, seed=21):
+    """A giant plus many small polygons overlapping its edge, as in a dissolve."""
+    rng = np.random.default_rng(seed)
+    small = [shapely.box(x, y, x + 60, y + 60)
+             for x, y in rng.uniform(-40, 19_990, (n, 2))]
+    return arr(GIANT, *small)
+
+
+def test_heavy_last_union_equals_a_plain_union():
+    geoms = _component_around_giant()
+    got = G._union_all(geoms)
+    expected = shapely.union_all(geoms)
+    assert got.area == pytest.approx(expected.area, rel=1e-12)
+    assert shapely.symmetric_difference(got, expected).area == pytest.approx(0.0, abs=1e-3)
+
+
+def test_giant_takes_part_in_exactly_one_union(monkeypatch):
+    """The cost fix: the giant must not be re-noded once per tree level."""
+    giant_verts = shapely.get_num_coordinates(GIANT)
+    calls_with_giant = []
+    real_all, real_pair = shapely.union_all, shapely.union
+
+    def spy_all(g, **kw):
+        if int(shapely.get_num_coordinates(g).max()) >= giant_verts:
+            calls_with_giant.append("union_all")
+        return real_all(g, **kw)
+
+    def spy_pair(a, b, **kw):
+        if max(shapely.get_num_coordinates(a), shapely.get_num_coordinates(b)) >= giant_verts:
+            calls_with_giant.append("union")
+        return real_pair(a, b, **kw)
+
+    monkeypatch.setattr(shapely, "union_all", spy_all)
+    monkeypatch.setattr(shapely, "union", spy_pair)
+    G._union_all(_component_around_giant())
+    assert calls_with_giant == ["union"], calls_with_giant
+
+
+def test_heavy_last_falls_back_when_the_fold_fails(monkeypatch):
+    def broken_union(a, b, **kw):
+        raise shapely.errors.GEOSException("found non-noded intersection")
+
+    monkeypatch.setattr(shapely, "union", broken_union)
+    geoms = _component_around_giant(n=30)
+    got = G._union_all(geoms)            # falls back to the general union_all path
+    assert got.area == pytest.approx(shapely.union_all(geoms).area, rel=1e-12)
+
+
+def test_dissolve_with_a_giant_component_is_unchanged():
+    geoms = _component_around_giant(n=200, seed=5)
+    got = G.dissolve(geoms)
+    assert shapely.area(got).sum() == pytest.approx(shapely.union_all(geoms).area, rel=1e-12)
+    assert all(g.geom_type == "Polygon" for g in got)

@@ -120,6 +120,14 @@ def _union_all(geoms: GeomArray):
     """``shapely.union_all`` hardened against topology exceptions."""
     if len(geoms) == 1:
         return geoms[0]
+
+    heavy = shapely.get_num_coordinates(geoms) >= HEAVY_VERTICES
+    if heavy.any() and not heavy.all():
+        try:
+            return _union_heavy_last(geoms, heavy)
+        except shapely.errors.GEOSException:
+            pass  # the general path below has the full recovery ladder
+
     last: Exception | None = None
     for grid_size in _GRID_LADDER:
         try:
@@ -136,6 +144,38 @@ def _union_all(geoms: GeomArray):
     # from.
     log.warning("union of %d features failed; splitting", len(geoms))
     return _union_divide(geoms, last)
+
+
+def _union_heavy_last(geoms: GeomArray, heavy: np.ndarray):
+    """Union the light geometries together first, then fold in the heavy ones.
+
+    ``union_all`` merges its inputs as a balanced tree, so one very large
+    polygon is re-noded at every level of the tree it passes through - about
+    log2(n) times for a group of n. The rice component around GUJRANWALA's
+    1.33-million-vertex polygon in 2017 had 126 members and took 93 seconds
+    that way. Unioning the 125 small members first and adding the large one
+    once took 14 seconds for the same result. Union is associative and
+    commutative, so the order changes nothing but the cost.
+
+    Heavy geometries are folded in smallest first, so the largest is processed
+    exactly once, at the end.
+    """
+    acc = _union_all(geoms[~heavy])
+    big = geoms[heavy]
+    for geom in big[np.argsort(shapely.get_num_coordinates(big), kind="stable")]:
+        acc = _union_pair(acc, geom)
+    return acc
+
+
+def _union_pair(a, b):
+    last: Exception | None = None
+    for grid_size in _GRID_LADDER:
+        try:
+            return (shapely.union(a, b) if grid_size is None
+                    else shapely.union(a, b, grid_size=grid_size))
+        except shapely.errors.GEOSException as exc:
+            last = exc
+    raise last  # type: ignore[misc]
 
 
 def _union_divide(geoms: GeomArray, last: Exception | None):
