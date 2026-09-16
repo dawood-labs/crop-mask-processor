@@ -1,5 +1,5 @@
 geopandas>=1.0
-shapely>=2.0
+shapely>=2.1
 pyogrio>=0.7
 pyproj>=3.5
 numpy>=1.24

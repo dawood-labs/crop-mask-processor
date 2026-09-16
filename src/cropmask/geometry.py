@@ -286,6 +286,28 @@ def _flatten_polygons(parts):
     return out
 
 
+def _make_valid(geoms):
+    """Repair with GEOS's "structure" method.
+
+    "structure" rebuilds a polygon as its shells minus its holes. The default
+    "linework" method re-nodes every edge and polygonises the result, which is
+    both slower and, for some invalid shapes, wrong about area:
+
+    * On the 1,330,827-vertex rice polygon in GUJRANWALA 2017 - invalid only
+      because rings touch at single points, the usual raster-vectorisation
+      artefact - linework took 275.7 s and structure 62.2 s, producing the same
+      polygon to within 0.000000 m2.
+    * Where a hole touches its shell along an edge, linework fills the hole back
+      in and reports it as crop; two overlapping holes likewise have their
+      overlap counted as crop. Structure removes both.
+
+    Across every invalid polygon in the 2024 season (669 of them) the two methods
+    disagree on 18 and the whole season's acreage moves by 0.02 acres, so outputs
+    made before this change remain comparable.
+    """
+    return shapely.make_valid(geoms, method="structure", keep_collapsed=False)
+
+
 def _repair(geoms: GeomArray) -> GeomArray:
     """``make_valid`` that cannot take a layer down with it.
 
@@ -296,7 +318,7 @@ def _repair(geoms: GeomArray) -> GeomArray:
     the old GEOS trick that re-nodes a ring without going through MakeValid.
     """
     try:
-        return shapely.make_valid(geoms)
+        return _make_valid(geoms)
     except shapely.errors.GEOSException:
         pass
 
@@ -310,12 +332,12 @@ def _repair(geoms: GeomArray) -> GeomArray:
 
 def _repair_one(geom):
     try:
-        return shapely.make_valid(geom)
+        return _make_valid(geom)
     except shapely.errors.GEOSException:
         pass
     for grid_size in (1e-3, 1e-2):
         try:
-            return shapely.make_valid(shapely.set_precision(geom, grid_size))
+            return _make_valid(shapely.set_precision(geom, grid_size))
         except shapely.errors.GEOSException:
             continue
     # There is deliberately no buffer(0) rung here. It is the traditional last

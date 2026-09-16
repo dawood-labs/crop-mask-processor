@@ -350,3 +350,32 @@ def test_dissolve_with_a_giant_component_is_unchanged():
     got = G.dissolve(geoms)
     assert shapely.area(got).sum() == pytest.approx(shapely.union_all(geoms).area, rel=1e-12)
     assert all(g.geom_type == "Polygon" for g in got)
+
+
+# --------------------------------------------------------------------------
+# repair method
+# --------------------------------------------------------------------------
+def test_repair_keeps_a_hole_that_touches_the_shell_along_an_edge():
+    """The default "linework" repair fills this hole back in and reports it as crop."""
+    shell = [(0, 0), (10, 0), (10, 10), (0, 10)]
+    hole = [(0, 2), (4, 2), (4, 6), (0, 6)]          # shares the x=0 edge
+    broken = shapely.Polygon(shell, holes=[hole])
+    assert not broken.is_valid
+    assert shapely.make_valid(broken, method="linework").area == pytest.approx(100.0)
+    assert G._repair_one(broken).area == pytest.approx(84.0)
+
+
+def test_repair_does_not_count_overlapping_holes_as_crop():
+    shell = [(0, 0), (10, 0), (10, 10), (0, 10)]
+    holes = [[(1, 1), (6, 1), (6, 6), (1, 6)], [(4, 4), (9, 4), (9, 9), (4, 9)]]
+    broken = shapely.Polygon(shell, holes=holes)
+    assert G._repair_one(broken).area == pytest.approx(100 - 46)
+
+
+def test_repair_of_touching_rings_is_unchanged():
+    """The common raster case: both methods must agree."""
+    broken = shapely.Polygon([(0, 0), (10, 0), (10, 10), (0, 10)],
+                             holes=[[(0, 0), (5, 2), (2, 5)]])
+    assert G._repair_one(broken).area == pytest.approx(
+        shapely.make_valid(broken, method="linework").area
+    )
