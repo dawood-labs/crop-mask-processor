@@ -30,6 +30,7 @@ import shapely
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
+from . import telemetry
 from .constants import SQM_PER_ACRE
 
 log = logging.getLogger(__name__)
@@ -326,19 +327,119 @@ def _difference_one(target, cutter):
     return None
 
 
+#: Margin, in metres, added around a target's bounding box before erasers are
+#: cut down to it. It keeps the target strictly inside the box, so nothing the
+#: box does at its own edges can ever touch the target's boundary.
+LOCAL_MARGIN = 1.0
+
+#: Above this many erasers on one target, the cutter is assembled from
+#: connected components instead of one union over all of them.
+COMPONENT_CUTTER_THRESHOLD = 32
+
+
+def _local_cutters(target, erasers: GeomArray) -> GeomArray:
+    """Only the part of each eraser that could possibly touch ``target``.
+
+    A difference only ever depends on the eraser inside the target:
+
+        T - E  ==  T - (E n B)     for any box B containing T
+
+    so every eraser can be cut down to the target's box first. Without this,
+    one very large eraser is reprocessed in full for every target it touches.
+    In the 2017 data a single 218,000-acre sugarcane polygon (237,602 vertices)
+    touched 1,005 cotton fields that each needed a union, and each union
+    re-noded the whole polygon: 6.2 seconds apiece, about 104 minutes in total,
+    for what is 2.7 ms once the eraser is cut to the field.
+
+    The cut uses a real intersection rather than ``clip_by_rect``. Measured on
+    all 8,288 affected targets, ``clip_by_rect`` is 2.5x faster but produced 612
+    invalid geometries; ``intersection`` produced none, and both erased the same
+    ground to within 4.5 square millimetres.
+
+    If a cut fails or comes back invalid, the whole original eraser is used for
+    that one feature. That is slower, never wrong: silently dropping an eraser
+    would leave crop overlap in the output.
+    """
+    if len(erasers) == 0:
+        return erasers
+
+    xmin, ymin, xmax, ymax = shapely.bounds(target)
+    m = LOCAL_MARGIN
+    bxmin, bymin, bxmax, bymax = xmin - m, ymin - m, xmax + m, ymax + m
+
+    eb = shapely.bounds(erasers)
+    already_local = (
+        (eb[:, 0] >= bxmin) & (eb[:, 1] >= bymin)
+        & (eb[:, 2] <= bxmax) & (eb[:, 3] <= bymax)
+    )
+    if already_local.all():
+        return erasers
+
+    box = shapely.box(bxmin, bymin, bxmax, bymax)
+    far = erasers[~already_local]
+    cut = _safe(shapely.intersection, far, box)
+
+    # Never trust a cut that failed or is invalid: fall back to the whole
+    # eraser for that feature.
+    usable = np.array([g is not None for g in cut], dtype=bool)
+    if usable.any():
+        usable[usable] = shapely.is_valid(cut[usable])
+    cut[~usable] = far[~usable]
+
+    # Cutting a polygon to a box can leave lines where it only grazes the box
+    # edge; keep the polygonal part. A cut that is entirely outside the box
+    # erases nothing and is dropped.
+    mixed = shapely.get_type_id(cut) == 7
+    if mixed.any():
+        cut[mixed] = np.array([_polygonal_parts_only(g) for g in cut[mixed]], dtype=object)
+    polygonal = np.isin(shapely.get_type_id(cut), [3, 6]) & ~shapely.is_empty(cut)
+
+    out = erasers.copy()
+    out[~already_local] = cut
+    keep = np.ones(len(erasers), dtype=bool)
+    keep[np.flatnonzero(~already_local)[~polygonal]] = False
+    return out[keep]
+
+
+def _cutter(erasers: GeomArray):
+    """One geometry covering every eraser, built as cheaply as it can be.
+
+    Erasers mostly do not touch each other, and a union over many disjoint
+    polygons spends nearly all its time re-noding geometry that never needed
+    merging - the same effect that made whole-layer dissolves unusable. Past a
+    threshold, only the connected components are unioned; the components are
+    pairwise disjoint, so a MultiPolygon of them is already a valid cutter.
+    """
+    if len(erasers) == 1:
+        return erasers[0]
+    if len(erasers) <= COMPONENT_CUTTER_THRESHOLD:
+        return _union_all(erasers)
+
+    parts = dissolve(erasers)
+    candidate = shapely.multipolygons(list(parts))
+    if shapely.is_valid(candidate):
+        return candidate
+    # Parts that touch along a line would make the MultiPolygon invalid; a real
+    # union is correct in that case, just slower.
+    return _union_all(parts)
+
+
 def _erase_one(target, erasers: GeomArray):
     """Erase every eraser from one target, degrading as far as needed."""
-    cutter = erasers[0] if len(erasers) == 1 else None
-    if cutter is None:
+    erasers = _local_cutters(target, erasers)
+    if len(erasers) == 0:
+        return target
+
+    with telemetry.timed("erase", target=target, erasers=erasers):
         try:
-            cutter = _union_all(erasers)
+            cutter = _cutter(erasers)
         except shapely.errors.GEOSException:
             cutter = None
 
-    if cutter is not None:
-        result = _difference_one(target, cutter)
-        if result is not None:
-            return result
+        if cutter is not None:
+            result = _difference_one(target, cutter)
+            if result is not None:
+                return result
 
     # The combined cutter is what GEOS choked on; subtract the erasers one at
     # a time instead. Each individual difference is a much simpler operation.
@@ -384,6 +485,70 @@ def _query(tree: "shapely.STRtree", geoms: GeomArray, predicate: str) -> np.ndar
         return tree.query(geoms)
 
 
+#: Geometries with at least this many vertices are always put on the side of
+#: an ``intersects`` query that GEOS prepares.
+HEAVY_VERTICES = 5_000
+
+
+def _intersecting_pairs(queries: GeomArray, candidates: GeomArray) -> np.ndarray:
+    """``[i, j]`` for every ``queries[i]`` that intersects ``candidates[j]``.
+
+    An R-tree predicate query prepares the geometry it is asked *with* and tests
+    it against the geometries stored *in* the tree. Preparing is what makes a
+    test cheap, so a small geometry tested against a very large unprepared one
+    walks every vertex of the large one - once per small geometry whose bounding
+    box overlaps it. On the 2017 data that made the cotton lookup for RAHIM YAR
+    KHAN take 146 seconds against a 237,602-vertex sugarcane polygon whose
+    bounding box spans most of the district. Asked the other way round, so the
+    large polygon is prepared once, the same lookup takes 2.3 seconds and
+    returns the identical 32,363 pairs.
+
+    Simply swapping the direction is not enough, because large polygons turn up
+    on either side - as erasers in one district, as targets in another, and on
+    both sides of the self-join in ``dissolve``. So the inputs are split by size
+    and asked three ways, each with the heavy side doing the asking:
+
+        heavy queries   ->  all candidates
+        light queries   ->  light candidates
+        light queries   <-  heavy candidates      (asked in reverse)
+
+    The three cover every ordered pair exactly once, and no light geometry is
+    ever tested against an unprepared heavy one. ``intersects`` is symmetric,
+    so asking in reverse returns the same pairs.
+    """
+    empty = np.empty((2, 0), dtype=np.intp)
+    if len(queries) == 0 or len(candidates) == 0:
+        return empty
+
+    q_heavy = shapely.get_num_coordinates(queries) >= HEAVY_VERTICES
+    c_heavy = shapely.get_num_coordinates(candidates) >= HEAVY_VERTICES
+    parts = []
+
+    heavy_q = np.flatnonzero(q_heavy)
+    if len(heavy_q):
+        hits = _query(shapely.STRtree(candidates), queries[heavy_q], "intersects")
+        parts.append(np.vstack([heavy_q[hits[0]], hits[1]]))
+
+    light_q = np.flatnonzero(~q_heavy)
+    if len(light_q):
+        light_c = np.flatnonzero(~c_heavy)
+        if len(light_c):
+            hits = _query(shapely.STRtree(candidates[light_c]), queries[light_q],
+                          "intersects")
+            parts.append(np.vstack([light_q[hits[0]], light_c[hits[1]]]))
+
+        heavy_c = np.flatnonzero(c_heavy)
+        if len(heavy_c):
+            hits = _query(shapely.STRtree(queries[light_q]), candidates[heavy_c],
+                          "intersects")
+            parts.append(np.vstack([light_q[hits[1]], heavy_c[hits[0]]]))
+
+    parts = [part for part in parts if part.size]
+    if not parts:
+        return empty
+    return np.concatenate(parts, axis=1)
+
+
 def total_acres(geoms: GeomArray) -> float:
     """Sum of feature areas in acres. Input must already be in a metric CRS.
 
@@ -415,8 +580,7 @@ def erase(targets: GeomArray, erasers: GeomArray) -> GeomArray:
     if len(targets) == 0 or len(erasers) == 0:
         return targets
 
-    tree = shapely.STRtree(erasers)
-    hits = _query(tree, targets, "intersects")
+    hits = _intersecting_pairs(targets, erasers)
     if hits.size == 0:
         return targets
 
@@ -460,9 +624,8 @@ def clip(targets: GeomArray, mask: GeomArray) -> GeomArray:
 
     mask_geom = mask[0] if len(mask) == 1 else _union_all(mask)
 
-    tree = shapely.STRtree(np.array([mask_geom], dtype=object))
     touching = np.zeros(len(targets), dtype=bool)
-    hits = _query(tree, targets, "intersects")
+    hits = _intersecting_pairs(targets, np.array([mask_geom], dtype=object))
     if hits.size:
         touching[hits[0]] = True
 
@@ -499,8 +662,7 @@ def dissolve(geoms: GeomArray, max_component_union: int = 100_000) -> GeomArray:
     if len(geoms) == 1:
         return _explode(geoms)
 
-    tree = shapely.STRtree(geoms)
-    pairs = _query(tree, geoms, "intersects")
+    pairs = _intersecting_pairs(geoms, geoms)
     pairs = pairs[:, pairs[0] != pairs[1]]
 
     if pairs.size == 0:

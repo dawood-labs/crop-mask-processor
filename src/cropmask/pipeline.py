@@ -27,8 +27,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import shapely
 
 from . import geometry as G
+from . import telemetry
 from .constants import CROP_ORDER, PREDICTED_VALUES
 from .discovery import DistrictTask, norm_name
 from .io_layers import read_geometries, write_intermediate, write_layer
@@ -126,6 +128,14 @@ def _blank_record(province: str, district: str, crop: str, source: str = "") -> 
         "status": "",
         "reason": "",
         "output_path": "",
+        # where the time went, so a slow district explains itself
+        "max_input_vertices": 0,
+        "seconds_read": 0.0,
+        "seconds_input_union": 0.0,
+        "seconds_erase": 0.0,
+        "seconds_clip": 0.0,
+        "seconds_dissolve": 0.0,
+        "seconds_write": 0.0,
     }
 
 
@@ -185,6 +195,8 @@ def process_district(
             layers[crop] = G.empty_array()
             continue
 
+        telemetry.set_context(f"{task.province} / {task.district} / {crop} read")
+        read_started = time.perf_counter()
         try:
             layers[crop] = read_geometries(path, metric)
         except Exception as exc:
@@ -194,7 +206,12 @@ def process_district(
             layers[crop] = G.empty_array()
             continue
 
+        rec["seconds_read"] = round(time.perf_counter() - read_started, 2)
         rec["input_polygons"] = len(layers[crop])
+        if len(layers[crop]):
+            rec["max_input_vertices"] = int(
+                shapely.get_num_coordinates(layers[crop]).max()
+            )
         # Two different measures, both needed. input_acres is the raw sum of
         # feature areas, which double-counts any overlap *within* the layer;
         # it is kept because the legacy report used it. input_union_acres
@@ -202,7 +219,10 @@ def process_district(
         # comparable with final_acres - that is taken after the dissolve has
         # collapsed self-overlap to once.
         rec["input_acres"] = G.total_acres(layers[crop])
+        union_started = time.perf_counter()
+        telemetry.set_context(f"{task.province} / {task.district} / {crop} input union")
         rec["input_union_acres"] = G.union_acres(layers[crop])
+        rec["seconds_input_union"] = round(time.perf_counter() - union_started, 2)
 
     # A crop we failed to READ is not the same as a crop this district does not
     # grow. An unreadable layer becomes an empty array, and erasing with an
@@ -242,11 +262,18 @@ def process_district(
         layers["Fall Maize"], layers["Sugarcane"], layers["Cotton"], layers["Rice"]
     )
 
+    def timed_erase(crop, targets, erasers):
+        telemetry.set_context(f"{task.province} / {task.district} / {crop} erase")
+        erase_started = time.perf_counter()
+        out = G.erase(targets, erasers)
+        records[crop]["seconds_erase"] = round(time.perf_counter() - erase_started, 2)
+        return out
+
     deoverlapped = {
         "Fall Maize": maize,                                   # never differenced
-        "Sugarcane": G.erase(cane, maize),
-        "Cotton": G.erase(cotton, _concat(maize, cane)),
-        "Rice": G.erase(rice, _concat(maize, cane, cotton)),
+        "Sugarcane": timed_erase("Sugarcane", cane, maize),
+        "Cotton": timed_erase("Cotton", cotton, _concat(maize, cane)),
+        "Rice": timed_erase("Rice", rice, _concat(maize, cane, cotton)),
     }
 
     inter_dir = out_root / "_intermediate" / task.province / task.district
@@ -264,7 +291,10 @@ def process_district(
     # ---- step 4: clip to the district polygon --------------------------
     clipped = {}
     for crop, geoms in deoverlapped.items():
+        telemetry.set_context(f"{task.province} / {task.district} / {crop} clip")
+        clip_started = time.perf_counter()
         clipped[crop] = G.clip(geoms, mask)
+        records[crop]["seconds_clip"] = round(time.perf_counter() - clip_started, 2)
         records[crop]["after_clip_acres"] = G.total_acres(clipped[crop])
         if cfg.keep_intermediates:
             write_intermediate(clipped[crop], inter_dir, f"{crop}_C", metric)
@@ -307,7 +337,10 @@ def process_district(
 
 def _finalise(geoms, crop, task, out_root: Path, rec: dict, inter_dir: Path, cfg):
     """Dissolve, explode, filter by area, apply the layer threshold, write."""
+    telemetry.set_context(f"{task.province} / {task.district} / {crop} dissolve")
+    dissolve_started = time.perf_counter()
     parts = G.dissolve(geoms)
+    rec["seconds_dissolve"] = round(time.perf_counter() - dissolve_started, 2)
     if cfg.keep_intermediates:
         write_intermediate(parts, inter_dir, f"{crop}_C_D_S", cfg.metric_crs)
 
@@ -339,7 +372,9 @@ def _finalise(geoms, crop, task, out_root: Path, rec: dict, inter_dir: Path, cfg
         return None
 
     path = final_output_path(out_root, crop, task.province, task.district)
+    write_started = time.perf_counter()
     write_layer(kept, path, PREDICTED_VALUES[crop], cfg.metric_crs, cfg.output_crs)
+    rec["seconds_write"] = round(time.perf_counter() - write_started, 2)
     rec["status"] = "kept"
     rec["output_path"] = str(path)
     return path

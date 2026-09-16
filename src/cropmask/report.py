@@ -17,6 +17,8 @@ COLUMN_ORDER = [
     "removed_small_polygons", "acres_removed_small",
     "final_polygons", "final_acres", "acres_lost_total",
     "input_shapefile", "output_path",
+    "max_input_vertices", "seconds_read", "seconds_input_union",
+    "seconds_erase", "seconds_clip", "seconds_dissolve", "seconds_write",
 ]
 
 
