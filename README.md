@@ -46,6 +46,16 @@ If you see the help text, you are set up. If you get `command not found`, your
 `~/.local/bin` is probably not on `PATH`; either add it, or run the tool as
 `python3 -m cropmask.cli` everywhere below instead of `cropmask`.
 
+The pipeline needs **shapely 2.1 or newer** (it uses a faster, more accurate way
+of repairing broken polygons that older versions do not have). Confirm which one
+Python actually picks up:
+
+```bash
+python3 -c "import shapely; print(shapely.__version__)"
+```
+
+If it prints `2.0.x`, run `pip install --user "shapely>=2.1"`.
+
 ## Step 3. Give it access to GCS
 
 The pipeline needs a service-account key file to read and write the bucket.
@@ -114,8 +124,19 @@ read the `reason` column before going further.
 cropmask -c config/default.yaml --year 2025
 ```
 
-Roughly half an hour for a full season. You can leave it; if your connection
-drops, see "If a run dies" below.
+A full season takes roughly 5 to 15 minutes; 2021 to 2024 took between 4 and
+13. You can leave it; if your connection drops, see "If a run dies" below.
+
+To run several seasons back to back without watching them:
+
+```bash
+python3 scripts/run_seasons.py 2018 2019 2020
+```
+
+It checks each season's files first, runs the seasons one after another, and
+writes `~/cropmask_runs/run_<year>.log` for each plus a one-line result per
+season in `~/cropmask_runs/seasons_summary.txt`. A season that ends with errors
+does not stop the queue.
 
 ## Step 7. Collect the results
 
@@ -124,7 +145,7 @@ gs://farmdar_data_catalog/fao/crop_processing/output/2025/
     Rice/Punjab/SAHIWAL/SAHIWAL_Rice.shp
     Cotton/Sindh/BADIN/BADIN_Cotton.shp
     ...
-    acreage_report.xlsx
+    acreage_report_2025.xlsx
 ```
 
 Each output shapefile carries a single integer column, `predicted`:
@@ -174,16 +195,64 @@ To genuinely redo everything from scratch, add `--overwrite`.
 A shapefile is missing its `.prj` sidecar, so there is no way to know what its
 coordinates mean. The pipeline refuses to guess — the same numbers could be
 degrees or metres, placing the data in completely different parts of the world.
+This has happened in 2019, 2021, 2022 and 2025.
 
-Fix the input: copy a `.prj` from another layer **of the same crop and the same
-source**, then re-run. Do not guess.
+Run the checker first; it only reports:
+
+```bash
+python3 scripts/fix_missing_prj.py --year 2021
+```
+
+For each missing `.prj` it looks for a candidate (a misnamed `.prj` in the same
+folder, or the one every other layer of that crop and season uses) and checks
+that the layer's coordinates, read that way, land inside its own district. Lines
+marked `OK` passed; `SKIP` means a person needs to look. When you are happy:
+
+```bash
+python3 scripts/fix_missing_prj.py --year 2021 --apply
+cropmask -c config/default.yaml --year 2021
+```
+
+The second command resumes, so only the districts that failed are processed.
+
+Districts where a crop could not be read still publish the crops that are not
+affected. Crops are cleaned in priority order, so if Cotton cannot be read, Rice
+in that district is held back too - it cannot be cleaned against the Cotton.
+
+## If a file is in the wrong province folder
+
+A district must only appear under its own province folder. If a copy turns up
+under the other province too (it happened with SANGHAR in 2023 and MIANWALI in
+2024), the pipeline uses the province recorded in the district boundary file,
+ignores the stray file, logs a warning, and lists it on the `Input_Anomalies`
+sheet. Nothing is merged or guessed. Ask the data team to remove the stray copy,
+or to move it if it turns out to be the right version.
 
 ## If a district is slow
 
-That is normal and it is not proportional to file size. Measured on 2025:
-RAHIM YAR KHAN is 635 MB and takes about 12 minutes; BAHAWALNAGAR is 189 MB and
-takes about 20. What costs time is how intricate the polygons are, not how many
-megabytes they occupy.
+Some districts take a few minutes; that is normal and has little to do with file
+size. What costs time is a very large polygon: about one layer in three has a
+single shape of more than 10,000 points, and GUJRANWALA's rice regularly has one
+of over a million. That district is usually the last to finish, at around five
+minutes.
+
+Any single geometry step slower than 5 seconds is logged with where it happened
+and how big the shapes were:
+
+```
+SLOW erase took 11.7s in Punjab / GUJRANWALA / Rice erase (target 1,353,947 verts, erasers 32 verts)
+```
+
+One of those per large district is expected. To see where a whole season's time
+went, after it finishes:
+
+```bash
+python3 scripts/hotspots.py ~/cropmask_runs/run_2024.log /tmp/cropmask/2024/acreage_report_2024.xlsx
+```
+
+It ranks time per stage (read, erase, clip, dissolve) and the slowest individual
+steps. If one step keeps coming top across seasons, that is the thing to
+optimise.
 
 ## If you are worried about memory
 
@@ -207,7 +276,7 @@ that file and not only on your screen.
 
 # Part 4 — Reading the workbook
 
-`acreage_report.xlsx` sits next to the outputs. Eight sheets:
+`acreage_report_<year>.xlsx` sits next to the outputs. Eight sheets:
 
 | Sheet | What it is for |
 |---|---|
@@ -295,6 +364,16 @@ it alone.
 against the threshold. Rounding first makes the real cut-off 0.505 acres, and
 the bias only ever deletes land.
 
+**`make_valid(method="structure")`.** Repairing broken polygons with the default
+"linework" method is four times slower on the largest shapes, and it gets area
+wrong in some cases: a hole touching its outer edge is filled back in and counted
+as crop. Across all of 2024 the two methods differ by 0.02 acres, but structure
+is the right one.
+
+**Province comes from the boundary file.** A district found under two province
+folders is resolved using the boundary file's `province` column, and the stray
+file is ignored and reported rather than processed as a second district.
+
 **File lookup by full path, never by filename.** Crop shapefiles are routinely
 named after their district — in the 2025 data, 58 of 66 districts have two or
 more crops whose files are both called `<DISTRICT>.shp`, differing only in
@@ -307,8 +386,18 @@ geometry for another, and the output still looks completely plausible.
 python3 -m pytest tests/ -v
 ```
 
-56 tests. Many of them exist because a specific bug shipped once; the docstring
+96 tests. Many of them exist because a specific bug shipped once; the docstring
 says which.
+
+To check a change against a real district before running a season, process it
+locally and compare with the last run's acreage:
+
+```bash
+python3 scripts/profile_district.py --year 2017 GUJRANWALA
+```
+
+It prints per-crop stage timings and a `match` column against the previous
+result.
 
 To check the fast implementation still agrees with the original, on real data:
 
@@ -338,6 +427,13 @@ genuinely touch each target, `dissolve` unions only the connected components of
 the touch graph, and `clip` skips the intersection for features fully inside the
 mask.
 
+**Very large polygons are never processed more than once per step.** An eraser
+is cut down to the target's bounding box before use; intersects queries always
+prepare the larger geometry; and unions add the largest shape last, once. Before
+this, a single 218,000-acre sugarcane polygon was re-processed for each of 1,005
+cotton fields in RAHIM YAR KHAN 2017, and the district did not finish in 50
+minutes. It now takes 3.
+
 ## Layout
 
 ```
@@ -355,7 +451,13 @@ src/cropmask/
     report.py       the Excel workbook
     resources.py    CPU and RAM detection
     calibration.py  learns real memory cost during the run
-tests/              56 tests
+    telemetry.py    logs slow geometry steps and per-stage timings
+tests/              96 tests
 scripts/
+    run_seasons.py          run several seasons back to back
+    fix_missing_prj.py      verify and supply missing .prj files
+    hotspots.py             rank a season's slowest steps
+    profile_district.py     run one district locally, with timings and an acreage check
     verify_equivalence.py   old implementation vs new, on real data
+    benchmark_legacy.py     time the original script against this one
 ```
