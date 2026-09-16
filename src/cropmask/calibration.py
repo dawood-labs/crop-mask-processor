@@ -81,13 +81,24 @@ class MemoryCalibrator:
     def ratio(self) -> float:
         """The ratio the scheduler should budget with right now."""
         with self._lock:
-            if self._samples < MIN_SAMPLES:
-                return self._configured
-            measured = max(MIN_RATIO, self._worst * SAFETY_MARGIN)
-            # Evidence may tighten the estimate or loosen it, but a measured
-            # value above the configured one always wins: that is real data
-            # saying the configured number was too optimistic.
-            return measured if measured > self._configured else max(MIN_RATIO, measured)
+            return self._ratio_unlocked()
+
+    def _ratio_unlocked(self) -> float:
+        """``ratio`` for callers that already hold the lock.
+
+        The lock is not re-entrant, so anything holding it must call this rather
+        than the property. ``summary`` used to read ``self.ratio`` while holding
+        the lock, which deadlocked the parent process at the very end of the
+        first season to collect enough samples - after every district was done,
+        before the report was written.
+        """
+        if self._samples < MIN_SAMPLES:
+            return self._configured
+        measured = max(MIN_RATIO, self._worst * SAFETY_MARGIN)
+        # Evidence may tighten the estimate or loosen it, but a measured
+        # value above the configured one always wins: that is real data
+        # saying the configured number was too optimistic.
+        return measured if measured > self._configured else max(MIN_RATIO, measured)
 
     def estimate(self, input_bytes: int) -> int:
         return self._baseline + int(input_bytes * self.ratio)
@@ -97,6 +108,6 @@ class MemoryCalibrator:
             if self._samples < MIN_SAMPLES:
                 return f"configured {self._configured:.1f}x ({self._samples} sample(s))"
             return (
-                f"{self.ratio:.2f}x from {self._samples} sample(s) "
+                f"{self._ratio_unlocked():.2f}x from {self._samples} sample(s) "
                 f"(worst measured {self._worst:.2f}x, configured {self._configured:.1f}x)"
             )

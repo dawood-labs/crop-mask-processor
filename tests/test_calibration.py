@@ -67,3 +67,22 @@ def test_small_districts_do_not_skew_the_ratio():
         cal.observe(1 * MB, WORKER_BASELINE_BYTES + 300 * MB)
     assert cal.ratio == 2.0
     assert cal.estimate(600 * MB) < WORKER_BASELINE_BYTES + 2.5 * 600 * MB
+
+
+def test_summary_does_not_deadlock_once_samples_arrive():
+    """Regression: summary() read self.ratio while holding the non-reentrant
+    lock. With enough samples to reach that branch, the parent process hung
+    forever after the last district of 2018 finished, before writing the report.
+    """
+    import threading
+
+    cal = MemoryCalibrator(initial_ratio=8.0)
+    for _ in range(10):
+        cal.observe(BIG, WORKER_BASELINE_BYTES + 2 * BIG)
+
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("text", cal.summary()), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "summary() deadlocked"
+    assert "from 10 sample(s)" in result["text"]
