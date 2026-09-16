@@ -123,3 +123,25 @@ def write_intermediate(
         gdf.to_file(directory / f"{safe}.shp", engine="pyogrio")
     except Exception as exc:
         log.debug("could not write intermediate %s: %s", name, exc)
+
+
+def read_district_provinces(path: str | Path, district_field: str, province_field: str) -> dict[str, str]:
+    """``{normalised district: normalised province}`` from the boundary file.
+
+    Returns an empty mapping when the province column is absent, in which case
+    discovery falls back to where most of a district's crops are filed.
+    """
+    from .discovery import norm_name
+
+    info = pyogrio.read_info(str(path))
+    if province_field not in list(info["fields"]):
+        log.warning("boundary file has no '%s' column; province folders will be "
+                    "resolved by majority", province_field)
+        return {}
+    table = pyogrio.read_dataframe(str(path), columns=[district_field, province_field],
+                                   read_geometry=False)
+    return {
+        norm_name(d): norm_name(p)
+        for d, p in zip(table[district_field], table[province_field])
+        if d is not None and p is not None
+    }

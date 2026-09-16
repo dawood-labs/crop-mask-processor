@@ -27,6 +27,10 @@ class Config:
     boundary_uri: str = ""
     #: Column in the boundary shapefile carrying the district name.
     boundary_field: str = "districts"
+    #: Column naming each district's province. Used only to resolve a district
+    #: that appears under more than one province folder; if the column is
+    #: missing, the folder holding most of the district's crops is used.
+    boundary_province_field: str = "province"
     #: Service-account JSON. Falls back to GOOGLE_APPLICATION_CREDENTIALS / ADC.
     credentials_json: str | None = None
 

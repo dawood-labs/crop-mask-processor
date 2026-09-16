@@ -26,7 +26,7 @@ from . import gcs
 from .calibration import MemoryCalibrator
 from .config import Config
 from .discovery import DistrictTask, build_index, select_tasks
-from .io_layers import read_boundaries
+from .io_layers import read_boundaries, read_district_provinces
 from .pipeline import DistrictResult
 from .state import filter_pending, load_completed
 from .resources import (
@@ -99,6 +99,9 @@ def prepare(cfg: Config) -> tuple[list[DistrictTask], list[dict], Path]:
         cfg.boundary_uri, work_dir / "boundary", cfg.credentials_json
     )
     _, lookup = read_boundaries(boundary_local, cfg.boundary_field, cfg.metric_crs)
+    district_provinces = read_district_provinces(
+        boundary_local, cfg.boundary_field, cfg.boundary_province_field
+    )
     log.info("Boundary: %d unique district names", len(lookup))
 
     log.info("Listing %s ...", cfg.input_uri)
@@ -106,7 +109,9 @@ def prepare(cfg: Config) -> tuple[list[DistrictTask], list[dict], Path]:
     log.info("Found %d objects", len(blobs))
 
     root_prefix = gcs.GcsPath.parse(cfg.input_uri).prefix
-    tasks_by_key, anomalies = build_index(blobs, root_prefix, set(lookup))
+    tasks_by_key, anomalies = build_index(
+        blobs, root_prefix, set(lookup), district_provinces
+    )
     log.info("Resolved %d district folders", len(tasks_by_key))
 
     tasks = select_tasks(tasks_by_key, cfg.only_provinces, cfg.only_districts, cfg.limit)

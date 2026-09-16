@@ -93,8 +93,13 @@ def build_index(
     blobs: list[tuple[str, int]],
     root_prefix: str,
     known_districts: set[str],
+    district_provinces: dict[str, str] | None = None,
 ) -> tuple[dict[tuple[str, str], DistrictTask], list[dict]]:
     """Group a blob listing into one :class:`DistrictTask` per district.
+
+    ``district_provinces`` maps a normalised district name to its normalised
+    province, as the boundary file records it. It is used only to resolve a
+    district found under more than one province folder.
 
     Returns the tasks plus a list of anomalies worth putting in the report.
     """
@@ -130,6 +135,10 @@ def build_index(
         stem = name[: -len(suffix)]
         key = (crop, province, district, stem)
         by_folder.setdefault(key, {}).setdefault(suffix, []).append((name, size))
+
+    by_folder = _drop_misplaced_province_folders(
+        by_folder, district_provinces or {}, anomalies
+    )
 
     # Collapse stems into one chosen shapefile per (crop, district).
     candidates: dict[tuple[str, str, str], list[CropInput]] = {}
@@ -185,6 +194,74 @@ def build_index(
         )
 
     return tasks, anomalies
+
+
+def _drop_misplaced_province_folders(by_folder, district_provinces, anomalies):
+    """Keep one province folder per district; report and ignore the others.
+
+    A district filed under two province folders was being split into two
+    independent tasks. The stray one was processed on its own - never erased by
+    the district's other crops - and published as an extra, un-de-overlapped
+    layer that the report then counted twice. It happened in 2023 (a byte-for-byte
+    copy of SANGHAR's rice under Punjab) and 2024 (a second, different version of
+    MIANWALI's rice under Sindh).
+
+    The province the boundary file records wins. Failing that, the folder holding
+    most of the district's crops wins. A stray file is never merged in as an
+    alternative candidate: with two genuinely different versions, as in MIANWALI,
+    that would silently pick whichever is larger. It is ignored and reported, so
+    a person decides.
+
+    Districts found under a single province folder are untouched, whatever that
+    folder is called.
+    """
+    provinces_by_district: dict[str, dict[str, set[str]]] = {}
+    for (crop, province, district, _stem) in by_folder:
+        provinces_by_district.setdefault(norm_name(district), {}) \
+            .setdefault(norm_name(province), set()).add(crop)
+
+    keep: dict[str, str | None] = {}
+    for district, provinces in provinces_by_district.items():
+        if len(provinces) == 1:
+            continue
+        official = district_provinces.get(district)
+        if official in provinces:
+            keep[district] = official
+            continue
+        ranked = sorted(provinces.items(), key=lambda kv: len(kv[1]), reverse=True)
+        if len(ranked[1][1]) == len(ranked[0][1]):
+            keep[district] = None      # a tie: nothing to go on
+            anomalies.append({
+                "issue": "district found under several province folders with no way "
+                         "to tell which is right - district skipped",
+                "district": district,
+                "provinces": " | ".join(sorted(provinces)),
+            })
+            log.error("%s is filed under %s and cannot be resolved; skipped",
+                      district, sorted(provinces))
+            continue
+        keep[district] = ranked[0][0]
+
+    if not keep:
+        return by_folder
+
+    kept = {}
+    for key, files in by_folder.items():
+        crop, province, district, stem = key
+        chosen = keep.get(norm_name(district), norm_name(province))
+        if norm_name(province) == chosen:
+            kept[key] = files
+            continue
+        shp = stem + ".shp"
+        anomalies.append({
+            "issue": "shapefile in the wrong province folder - ignored",
+            "crop": crop, "province": province, "district": district,
+            "ignored": shp,
+            "district_province": chosen or "unresolved",
+        })
+        log.warning("ignoring %s: %s belongs under %s, not %s",
+                    shp, district, chosen or "an unresolved province", province)
+    return kept
 
 
 def select_tasks(
